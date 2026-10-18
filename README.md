@@ -57,7 +57,7 @@ These services provide card information, deck references, and related assets use
 
 ### Option 1: Use the Hosted Web App
 
-If a deployed version already exists, open the web URL and use it directly.
+If a deployed version already exists, open the web URL and use it directly.(https://script.google.com/macros/s/AKfycbyN4jObRdmYdBliDnWD_RrOykit35M12xYGGgbxNeEqFa86-Rc9SwWtV-egQFP0A4pc/exec)
 
 ### Option 2: Deploy Your Own Copy
 
