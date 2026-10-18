@@ -1,0 +1,116 @@
+<script>
+(function () {
+  'use strict';
+  if (!window.AD) return;
+  var AD = window.AD, $ = AD.$, esc = AD.esc, money = AD.money;
+  var KEYS = ['id', 'image', 'art_crop', 'set', 'collector_number', 'price', 'legal', 'pk'];
+  var arr = function (x) { return Array.isArray(x) ? x : []; };
+  var wait = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var isPk = function () { var d = AD.deck(); return d && d.game === 'pokemon'; };
+
+  document.body.insertAdjacentHTML('beforeend',
+    '<div class="modal-overlay" id="optModal"><div class="modal modal-large"><h3>💰 Price Optimiser</h3>' +
+    '<div id="optStatus" style="font-size:13px"></div><div style="height:6px;background:var(--bg-base);border-radius:3px"><div id="optFill" style="height:100%;width:0;background:var(--cyan);border-radius:3px;transition:width .2s"></div></div>' +
+    '<div id="optList" style="max-height:340px;overflow:auto;font-size:12px;display:flex;flex-direction:column;gap:4px"></div>' +
+    '<div style="display:flex;justify-content:flex-end;gap:10px"><button type="button" class="danger" id="optUndo" style="display:none" data-action="opt-undo">↩ Undo All Swaps</button><button type="button" data-action="close-modal" data-modal="optModal">Close</button></div></div></div>' +
+    '<div class="modal-overlay" id="bracketModal"><div class="modal modal-large"><div style="display:flex;justify-content:space-between;align-items:center"><h3>🏷️ Commander Bracket Estimate</h3><button type="button" data-action="close-modal" data-modal="bracketModal">✕</button></div>' +
+    '<div id="brBody" style="max-height:70vh;overflow:auto;display:flex;flex-direction:column;gap:12px;font-size:13px"></div></div></div>');
+  document.querySelector('#builderNavControls [data-action="export-deck"]').insertAdjacentHTML('beforebegin',
+    '<button type="button" id="btnOpt" data-action="opt-run">💰 Optimise</button><button type="button" id="btnBracket" data-action="bracket-open">🏷️ Bracket</button>');
+
+  // ================= PRICE OPTIMISER =================
+  var busy = false, swaps = [];
+  function isBasic(c) { return (c.pk && c.pk.basic) || /basic land/i.test(c.type); }
+  function mtgCheapest(c) {
+    return AD.sf('https://api.scryfall.com/cards/search?unique=prints&order=usd&dir=asc&q=' + encodeURIComponent('!"' + c.name + '"')).then(function (j) {
+      var best = null; (j.data || []).forEach(function (p) { var n = AD.fromSf(p, c.qty); if (n.price > 0 && (!best || n.price < best.price)) best = n; }); return best;
+    }).catch(function (e) { if (/404/.test(e.message)) return null; throw e; });
+  }
+  function runOpt() {
+    var d = AD.deck(); if (!d) return;
+    if (busy) { AD.openM('optModal'); return; }
+    var cards = d.cards.filter(function (c) { return !c.locked && !isBasic(c) && c.price > 0; }), locked = d.cards.filter(function (c) { return c.locked; }).length;
+    if (!cards.length) { AD.toast(d.cards.length ? 'Nothing to optimise (all locked, basic or unpriced).' : 'Deck is empty.'); return; }
+    var pk = isPk(), i = 0, errs = 0; swaps = []; busy = true;
+    $('optList').innerHTML = ''; $('optUndo').style.display = 'none'; $('optFill').style.width = '0'; AD.openM('optModal');
+    function step() {
+      if (i >= cards.length) return;
+      var c = cards[i++]; $('optStatus').textContent = 'Checking printings… ' + i + '/' + cards.length + ' — ' + c.name; $('optFill').style.width = Math.round(i / cards.length * 100) + '%';
+      return (pk ? AD.pk.cheapest(c) : mtgCheapest(c)).then(function (n) {
+        if (n && n.price < c.price - 0.005) { var b = {}; KEYS.forEach(function (k) { b[k] = c[k]; }); KEYS.forEach(function (k) { c[k] = n[k]; }); swaps.push({ c: c, before: b, after: n }); }
+      }).catch(function () { errs++; }).then(function () { return wait(pk ? 30 : 110); }).then(step);
+    }
+    step().then(function () {
+      busy = false; var saved = swaps.reduce(function (s, x) { return s + (x.before.price - x.after.price) * x.c.qty; }, 0);
+      AD.save(); AD.render();
+      $('optStatus').innerHTML = '<b style="color:var(--success)">Saved ' + money(saved) + '</b> across ' + swaps.length + ' card' + (swaps.length === 1 ? '' : 's') + ' · ' + (cards.length - swaps.length - errs) + ' already cheapest' + (locked ? ' · ' + locked + ' locked' : '') + (errs ? ' · ' + errs + ' failed' : '');
+      $('optList').innerHTML = swaps.map(function (x) { return '<div style="display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid var(--border)"><span>' + esc(x.c.name) + ' ×' + x.c.qty + '</span><span style="color:var(--text-muted)">' + esc(x.before.set) + ' #' + esc(x.before.collector_number) + ' ' + money(x.before.price) + ' → <b style="color:var(--cyan)">' + esc(x.after.set) + ' #' + esc(x.after.collector_number) + ' ' + money(x.after.price) + '</b></span></div>'; }).join('') || '<div style="color:var(--text-muted)">Every unlocked card is already its cheapest printing.</div>';
+      if (swaps.length) $('optUndo').style.display = 'inline-flex';
+      AD.toast(swaps.length ? 'Saved ' + money(saved) + ' — Undo is in the optimiser window' : 'Already optimal');
+    }).catch(function (e) { busy = false; $('optStatus').textContent = 'Optimiser error: ' + e.message; });
+  }
+  function undoOpt() {
+    var d = AD.deck(); if (!d) return;
+    swaps.forEach(function (x) { if (d.cards.indexOf(x.c) >= 0) KEYS.forEach(function (k) { x.c[k] = x.before[k]; }); });
+    swaps = []; $('optUndo').style.display = 'none'; $('optList').innerHTML = ''; $('optStatus').textContent = 'All swaps undone.'; AD.save(); AD.render(); AD.toast('Swaps undone');
+  }
+
+  // ================= BRACKET ESTIMATOR =================
+  var NAMES = { 1: 'Exhibition', 2: 'Core', 3: 'Upgraded', 4: 'Optimized', 5: 'cEDH' }, cache = { sig: '', res: null };
+  var cn = function (c) { return (c && (c.name || (c.card && c.card.name))) || '?'; };
+  function comboHtml(list, label) {
+    if (!list.length) return '';
+    return '<div><b>' + label + '</b> (' + list.length + ')' + list.slice(0, 12).map(function (v) {
+      var names = arr(v.uses).map(function (u) { return cn(u.card || u); }).join(' + '), prod = arr(v.produces).map(function (p) { return cn(p.feature || p); }).slice(0, 3).join(', ');
+      return '<div style="margin:3px 0 0 10px;color:var(--text-muted)">• ' + (v.id ? '<a href="https://commanderspellbook.com/combo/' + esc(v.id) + '" target="_blank" style="color:var(--cyan)">' + esc(names) + '</a>' : esc(names)) + (prod ? ' → ' + esc(prod) : '') + '</div>';
+    }).join('') + '</div>';
+  }
+  function cardsHtml(list, label, note) {
+    var n = list.map(cn);
+    return '<div><b>' + label + '</b> (' + n.length + ')' + (note ? ' <span style="color:var(--text-muted)">' + note + '</span>' : '') + (n.length ? '<div style="margin:3px 0 0 10px;color:var(--text-muted)">' + n.map(esc).join(', ') + '</div>' : '') + '</div>';
+  }
+  function showBracket(r, degraded) {
+    var gc = arr(r.gameChangerCards), mld = arr(r.massLandDenialCards), xt = arr(r.extraTurnCards), tut = arr(r.tutorCards), mldC = arr(r.massLandDenialCombos), xtC = arr(r.extraTurnsCombos);
+    var eD = arr(r.definitelyEarlyGameTwoCardCombos), eA = arr(r.arguablyEarlyGameTwoCardCombos), lD = arr(r.definitelyLateGameTwoCardCombos), lB = arr(r.borderlineLateGameTwoCardCombos), lock = arr(r.lockCombos).concat(arr(r.skipTurnsCombos));
+    var b = 2, why = []; function fl(n, t) { why.push('<b>Bracket ' + n + '+</b>: ' + t); if (n > b) b = n; }
+    if (gc.length > 3) fl(4, gc.length + ' Game Changers (Bracket 3 allows up to 3)'); else if (gc.length) fl(3, gc.length + ' Game Changer' + (gc.length > 1 ? 's' : '') + ' (not allowed in Brackets 1–2)');
+    if (mld.length || mldC.length) fl(4, 'mass land denial (not allowed below Bracket 4)');
+    if (xtC.length) fl(4, 'extra-turn chains/loops'); else if (xt.length >= 3) fl(3, xt.length + ' extra-turn cards (should be few and never chained below Bracket 4)');
+    if (eD.length) fl(4, 'two-card combo that can come together early'); else if (eA.length) fl(3, 'borderline-early two-card combo');
+    else if (lD.length || lB.length) fl(3, 'two-card combo (late game only is allowed from Bracket 3)');
+    if (lock.length) fl(3, 'lock / turn-skip combo');
+    var title = !why.length ? 'Bracket 2 (Core) — or 1 (Exhibition) if it is strongly themed' : 'Bracket ' + b + ' — ' + NAMES[b];
+    $('btnBracket').textContent = '🏷️ Bracket ' + (why.length ? b : '1–2');
+    $('brBody').innerHTML = (degraded ? '<div style="color:var(--gold)">⚠ ' + esc(degraded) + '</div>' : '') +
+      '<div style="background:var(--bg-panel);border:1px solid var(--border-light);border-radius:8px;padding:14px"><div style="font-size:20px;font-weight:800;color:var(--cyan)">' + esc(title) + '</div><div style="margin-top:8px;display:flex;flex-direction:column;gap:3px">' + (why.length ? why.join('<br>') : 'No Game Changers, mass land denial, extra-turn chains or two-card combos found.') + '</div></div>' +
+      cardsHtml(gc, 'Game Changers', 'limit: 0 in B1–2, 3 in B3, unlimited in B4–5') + cardsHtml(mld, 'Mass land denial') + comboHtml(mldC, 'Mass land denial combos') +
+      cardsHtml(xt, 'Extra-turn cards') + comboHtml(xtC, 'Extra-turn combos') + cardsHtml(tut, 'Tutors', '(information only — Wizards removed the tutor restriction in Oct 2025)') +
+      comboHtml(eD, 'Two-card combos — definitely early game') + comboHtml(eA, 'Two-card combos — arguably early game') + comboHtml(lD, 'Two-card combos — late game') + comboHtml(lB, 'Two-card combos — borderline late game') + comboHtml(lock, 'Lock / turn-skip combos') +
+      '<div style="color:var(--text-muted);font-size:12px">This is an estimate of the minimum bracket the list can support. Brackets 1 vs 2 and 4 vs 5 depend on intent and theme, not cards — talk it through pre-game. Combo data: Commander Spellbook. Game Changers follow the current official list.</div>';
+  }
+  function bracketFallback(d, err) {
+    var names = {}; d.cards.forEach(function (c) { names[c.name.toLowerCase()] = 1; });
+    return AD.sf('https://api.scryfall.com/cards/search?q=' + encodeURIComponent('is:gamechanger')).then(function (j) {
+      showBracket({ gameChangerCards: (j.data || []).filter(function (p) { return names[p.name.toLowerCase()]; }) }, 'Commander Spellbook unavailable (' + err + '). Showing Game Changers only — combos, land denial and extra turns were not checked.');
+    }).catch(function () { $('brBody').textContent = 'Could not reach Spellbook or Scryfall: ' + err; });
+  }
+  function runBracket() {
+    var d = AD.deck(); if (!d || d.game !== 'mtg') return;
+    AD.openM('bracketModal');
+    var cmd = d.cards.filter(function (c) { return c.isCommander; }), main = d.cards.filter(function (c) { return !c.isCommander; });
+    if (!cmd.length) { $('brBody').textContent = 'Assign a Commander first (click 👑 on a card), then reopen this.'; return; }
+    var sig = JSON.stringify(d.cards.map(function (c) { return [c.name, c.qty, c.isCommander]; }));
+    if (cache.sig === sig) { showBracket(cache.res); return; }
+    $('brBody').textContent = 'Asking Commander Spellbook…';
+    fetch('https://backend.commanderspellbook.com/estimate-bracket', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ commanders: cmd.map(function (c) { return { card: c.name, quantity: 1 }; }), main: main.map(function (c) { return { card: c.name, quantity: c.qty }; }) }) })
+      .then(function (r) { if (!r.ok) return r.text().then(function (t) { throw new Error('HTTP ' + r.status + ' ' + t.slice(0, 120)); }); return r.json(); })
+      .then(function (res) { cache = { sig: sig, res: res }; showBracket(res); })
+      .catch(function (e) { bracketFallback(d, e.message); });
+  }
+
+  AD.A['opt-run'] = runOpt; AD.A['opt-undo'] = undoOpt; AD.A['bracket-open'] = runBracket;
+  AD.tools = { afterRender: function (d) { $('btnBracket').style.display = d.game === 'mtg' ? '' : 'none'; if (d.game === 'mtg' && cache.sig && cache.sig !== JSON.stringify(d.cards.map(function (c) { return [c.name, c.qty, c.isCommander]; }))) $('btnBracket').textContent = '🏷️ Bracket'; } };
+  if (document.readyState !== 'loading') AD.render();
+})();
+</script>
