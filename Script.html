@@ -1,0 +1,504 @@
+<script>
+(function () {
+  'use strict';
+  window.onerror = function (m, u, l) {
+    var b = document.getElementById('errorBanner');
+    if (b) { b.textContent = 'Script Error (line ' + l + '): ' + m; b.style.display = 'block'; }
+  };
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
+  var money = function (n) { return '$' + (Number(n) || 0).toFixed(2); };
+  var FT = { Commander: 100, Standard: 60, Modern: 60, Pioneer: 60, Legacy: 60, Pauper: 60, Casual: 60 };
+  var KEY = 'antideck_state'; // same key as the old version, so old decks still load
+
+  // ---------- storage (localStorage + server backup) ----------
+  var mem = {};
+  var store = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return mem[k] || null; } },
+    set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { mem[k] = v; } }
+  };
+  var hasGS = function () { return window.google && google.script && google.script.run; };
+  var S = { activeDeckId: null, currentView: 'home', builderMode: 'slices', decks: [], advArtMode: 'full', savedAt: 0, game: 'mtg' };
+  var mtgFormats = '';
+  var remoteTimer = null;
+  function save() {
+    S.savedAt = Date.now();
+    store.set(KEY, JSON.stringify(S));
+    if (!hasGS()) return;
+    clearTimeout(remoteTimer);
+    remoteTimer = setTimeout(function () {
+      google.script.run.withFailureHandler(function (e) { console.warn('Server save failed', e); }).saveAppState(JSON.stringify(S));
+    }, 1500);
+  }
+
+  // ---------- data helpers ----------
+  function cc(c) {
+    c = c || {};
+    return {
+      id: String(c.id || 'c' + Date.now() + Math.random().toString(36).slice(2, 6)),
+      name: String(c.name || 'Unknown Card'), qty: Math.max(1, parseInt(c.qty, 10) || 1),
+      isCommander: !!c.isCommander, type: String(c.type || c.type_line || ''),
+      mana_cost: String(c.mana_cost || ''), cmc: Number(c.cmc) || 0,
+      set: String(c.set || '').toUpperCase(), collector_number: String(c.collector_number || ''),
+      image: String(c.image || c.image_url || ''), art_crop: String(c.art_crop || c.image || c.image_url || ''),
+      price: Number(c.price || c.price_usd) || 0, oracle_text: String(c.oracle_text || ''),
+      color_identity: String(c.color_identity || ''),
+      locked: !!c.locked, category: String(c.category || ''), legal: c.legal === false ? false : (c.legal === true ? true : null), pk: c.pk || null
+    };
+  }
+  function cd(d) {
+    d = d || {};
+    return { id: String(d.id || 'deck_' + Date.now() + Math.floor(Math.random() * 1000)), name: String(d.name || 'Untitled Deck'),
+      format: String(d.format || 'Commander'), game: d.game === 'pokemon' ? 'pokemon' : 'mtg', bannerArt: d.bannerArt || '', cards: Array.isArray(d.cards) ? d.cards.map(cc) : [] };
+  }
+  function fromSf(p, qty, cmdr) {
+    var f = p.card_faces || [], u = p.image_uris || (f[0] && f[0].image_uris) || {}, pr = p.prices || {};
+    return cc({ id: p.id, name: p.name, qty: qty || 1, isCommander: !!cmdr, type: p.type_line,
+      mana_cost: p.mana_cost || f.map(function (x) { return x.mana_cost; }).filter(Boolean).join(' // '),
+      cmc: p.cmc, set: p.set, collector_number: p.collector_number,
+      image: u.normal || u.large || u.small || '', art_crop: u.art_crop || u.normal || '',
+      price: parseFloat(pr.usd || pr.usd_foil || pr.usd_etched || 0),
+      oracle_text: p.oracle_text || f.map(function (x) { return x.oracle_text; }).filter(Boolean).join('\n---\n'),
+      color_identity: (p.color_identity || []).join('') });
+  }
+  function deck() {
+    for (var i = 0; i < S.decks.length; i++) if (S.decks[i].id === S.activeDeckId) return S.decks[i];
+    return S.decks.filter(function (d) { return d.game === S.game; })[0] || null;
+  }
+  function ensureGameDeck() {
+    var l = S.decks.filter(function (d) { return d.game === S.game; }), pk = S.game === 'pokemon';
+    if (!l.length) { var n = cd({ name: pk ? 'My Pokémon Deck' : 'My Commander Deck', format: pk ? 'Standard' : 'Commander', game: S.game }); S.decks.push(n); l = [n]; }
+    if (!l.some(function (d) { return d.id === S.activeDeckId; })) S.activeDeckId = l[0].id;
+  }
+  function applyGame() {
+    var pk = S.game === 'pokemon';
+    if (!mtgFormats) mtgFormats = $('newDeckFormat').innerHTML;
+    document.documentElement.style.setProperty('--cyan', pk ? '#ffcb05' : '#00e5ff');
+    if ($('gameSwitch')) $('gameSwitch').value = S.game;
+    $('cardSearchInput').placeholder = pk ? "Quick search Pokémon card (e.g. Pikachu ex, Boss's Orders)..." : 'Quick search card (e.g. Sol Ring, Rhystic Study)...';
+    var o = pk ? '<option value="Standard">Standard (60 cards)</option><option value="Casual">Casual / Freeform</option>' : mtgFormats;
+    ['newDeckFormat', 'editDeckFormat'].forEach(function (id) { var el = $(id); if (el.getAttribute('data-game') !== S.game) { el.innerHTML = o; el.setAttribute('data-game', S.game); } });
+  }
+  function setGame(g) { S.game = g === 'pokemon' ? 'pokemon' : 'mtg'; S.currentView = 'home'; ensureGameDeck(); save(); render(); }
+  function findCard(id) { var d = deck(); if (!d) return null; for (var i = 0; i < d.cards.length; i++) if (d.cards[i].id === id) return d.cards[i]; return null; }
+  function addToDeck(c) {
+    var d = deck(); if (!d) return;
+    var n = c.name.toLowerCase();
+    for (var i = 0; i < d.cards.length; i++) {
+      if (d.cards[i].id === c.id || d.cards[i].name.toLowerCase() === n) { d.cards[i].qty += c.qty; if (c.isCommander) d.cards[i].isCommander = true; return; }
+    }
+    d.cards.push(c);
+  }
+  function sf(url, opt) { return fetch(url, opt).then(function (r) { if (!r.ok) throw new Error('Scryfall ' + r.status); return r.json(); }); }
+
+  // ---------- UI helpers ----------
+  var toastT;
+  function toast(m) { var t = $('toast'); t.textContent = m; t.style.display = 'block'; clearTimeout(toastT); toastT = setTimeout(function () { t.style.display = 'none'; }, 2400); }
+  function openM(id) {
+    if (id === 'deckSettingsModal') { var d = deck(); if (d) { $('editDeckName').value = d.name; $('editDeckFormat').value = d.format; } }
+    $(id).classList.add('active');
+  }
+  function closeM(id) { $(id).classList.remove('active'); if (id === 'importModal') $('statusMsg').textContent = ''; if (id === 'confirmModal') pending = null; if (id === 'cardDetailModal') cur = null; }
+  var pending = null;
+  function ask(msg, fn) { $('confirmMsg').textContent = msg; pending = fn; openM('confirmModal'); }
+
+  // ---------- deck / card operations ----------
+  function qty(id, delta) {
+    var d = deck(), c = findCard(id); if (!c) return;
+    c.qty += delta;
+    if (c.qty <= 0) d.cards = d.cards.filter(function (x) { return x.id !== id; });
+    save(); render();
+  }
+  function toggleCmdr(id) {
+    var d = deck(), c = findCard(id); if (!c) return;
+    if (!c.isCommander && d.cards.filter(function (x) { return x.isCommander; }).length >= 2) { toast('Max 2 commanders (partners). Unset one first.'); return; }
+    c.isCommander = !c.isCommander; save(); render();
+    toast(c.isCommander ? '👑 ' + c.name + ' set as Commander' : 'Unset ' + c.name);
+  }
+  function createDeck() {
+    var d = cd({ name: $('newDeckName').value.trim() || 'Untitled Deck', format: $('newDeckFormat').value, game: S.game });
+    S.decks.push(d); S.activeDeckId = d.id; S.currentView = 'builder';
+    $('newDeckName').value = ''; closeM('newDeckModal'); save(); render(); toast('Deck created');
+  }
+  function removeDeck(id) {
+    if (S.decks.length <= 1) { toast('You must keep at least one deck.'); return; }
+    ask('Permanently delete this deck?', function () {
+      S.decks = S.decks.filter(function (d) { return d.id !== id; });
+      ensureGameDeck();
+      S.currentView = 'home'; closeM('deckSettingsModal'); save(); render(); toast('Deck deleted');
+    });
+  }
+  function exportText() {
+    var d = deck(); if (!d) return '';
+    if (d.game === 'pokemon' && window.AD && AD.pk) return AD.pk.exportText(d);
+    return d.cards.map(function (c) { return (c.qty + ' ' + c.name + (c.set ? ' (' + c.set + ') ' + c.collector_number : '') + (c.isCommander ? ' // Commander' : '')).trim(); }).join('\n');
+  }
+
+  // ---------- render ----------
+  function render() {
+    ensureGameDeck(); applyGame();
+    var home = S.currentView === 'home';
+    $('viewHome').style.display = home ? 'block' : 'none';
+    $('viewBuilder').style.display = home ? 'none' : 'flex';
+    $('builderNavControls').style.display = home ? 'none' : 'flex';
+    $('btnToggleView').textContent = S.builderMode === 'slices' ? '🖼️ Visual Cards' : '📑 Slice View';
+    if (home) renderHome(); else renderBuilder();
+  }
+  function renderHome() {
+    $('deckGridContainer').innerHTML = S.decks.filter(function (d) { return d.game === S.game; }).map(function (d) {
+      var q = 0, p = 0, cmd = null;
+      d.cards.forEach(function (c) { q += c.qty; p += c.price * c.qty; if (c.isCommander && !cmd) cmd = c; });
+      var art = d.bannerArt || (cmd || d.cards[0] || {}).art_crop || '';
+      return '<div class="deck-tile" data-action="open-deck" data-deck-id="' + d.id + '"><div class="deck-tile-art" style="background-image:url(\'' + esc(art) + '\')"><div class="deck-tile-art-gradient"></div><div class="deck-tile-format">' + esc(d.format) + '</div></div>' +
+        '<div class="deck-tile-body"><div class="deck-tile-name">' + esc(d.name) + '</div><div class="deck-tile-meta"><span>Cards: <strong>' + q + '</strong></span><span>Value: <strong>' + money(p) + '</strong></span></div></div>' +
+        '<div class="deck-tile-actions"><button type="button" class="icon-btn" data-action="clone-deck" data-deck-id="' + d.id + '">Clone</button><button type="button" class="icon-btn" style="color:var(--danger)" data-action="delete-deck" data-deck-id="' + d.id + '">Delete</button></div></div>';
+    }).join('');
+  }
+  function renderBuilder() {
+    var d = deck(); if (!d) return;
+    $('deckSelect').innerHTML = S.decks.filter(function (x) { return x.game === S.game; }).map(function (x) { return '<option value="' + x.id + '"' + (x.id === d.id ? ' selected' : '') + '>' + esc(x.name) + ' (' + esc(x.format) + ')</option>'; }).join('');
+    $('deckTitleDisplay').textContent = d.name; $('deckFormatDisplay').textContent = d.format;
+    $('targetCardCount').textContent = FT[d.format] || 60;
+    // commander zone
+    var cmds = d.cards.filter(function (c) { return c.isCommander; }), z = $('commanderZone');
+    if (d.game === 'pokemon' || (d.format !== 'Commander' && !cmds.length)) z.style.display = 'none';
+    else {
+      z.style.display = 'flex'; $('commanderSlotCount').textContent = cmds.length + ' / 2 Assigned';
+      $('commanderGrid').innerHTML = cmds.length ? cmds.map(function (c, i) {
+        return '<div class="commander-hero-card" data-action="open-card-modal" data-card-id="' + c.id + '"><div class="commander-hero-art" style="background-image:url(\'' + esc(c.art_crop) + '\')"><div class="commander-hero-art-gradient"></div></div><div class="commander-hero-info"><div><span class="commander-badge">' + (i ? 'Partner' : 'Commander') + '</span><div class="commander-hero-name">' + esc(c.name) + '</div><div style="font-size:11px;color:var(--text-muted)">' + esc(c.mana_cost) + ' &bull; ' + esc(c.type) + '</div></div>' +
+          '<div style="display:flex;align-items:center;justify-content:space-between"><span style="font-size:12px;font-weight:700;color:var(--cyan)">' + money(c.price * c.qty) + '</span><div style="display:flex;gap:4px"><button type="button" class="icon-btn" data-action="change-art" data-card-id="' + c.id + '">🖼️</button><button type="button" class="icon-btn is-commander" data-action="toggle-cmdr" data-card-id="' + c.id + '">👑 Unset</button></div></div></div></div>';
+      }).join('') : '<div style="grid-column:1/-1;padding:12px;text-align:center;color:var(--text-muted);font-size:13px;border:1px dashed var(--border-light);border-radius:6px">No Commander assigned. Click 👑 on any card below.</div>';
+    }
+    // analytics + board
+    var tq = 0, tp = 0, tc = 0, nc = 0, curve = [0, 0, 0, 0, 0, 0, 0, 0];
+    var pkm = d.game === 'pokemon', hs = 0, hn = 0;
+    var cats = pkm ? { 'Pokémon': [], Trainer: [], Energy: [] } : { Creatures: [], Planeswalkers: [], Instants: [], Sorceries: [], Artifacts: [], Enchantments: [], Lands: [], Other: [] };
+    d.cards.forEach(function (c) {
+      var t = c.type.toLowerCase(); tq += c.qty; tp += c.price * c.qty;
+      if (pkm) { cats[c.category === 'Trainer' ? 'Trainer' : c.category === 'Energy' ? 'Energy' : 'Pokémon'].push(c); if (c.pk && c.pk.hp) { hs += c.pk.hp * c.qty; hn += c.qty; } return; }
+      if (t.indexOf('land') < 0) { tc += c.cmc * c.qty; nc += c.qty; curve[Math.min(Math.floor(c.cmc), 7)] += c.qty; }
+      if (c.isCommander) return;
+      var k = t.indexOf('creature') >= 0 ? 'Creatures' : t.indexOf('planeswalker') >= 0 ? 'Planeswalkers' : t.indexOf('instant') >= 0 ? 'Instants' : t.indexOf('sorcery') >= 0 ? 'Sorceries' : t.indexOf('artifact') >= 0 ? 'Artifacts' : t.indexOf('enchantment') >= 0 ? 'Enchantments' : t.indexOf('land') >= 0 ? 'Lands' : 'Other';
+      cats[k].push(c);
+    });
+    $('totalCardCount').textContent = tq; $('totalDeckPrice').textContent = money(tp); $('avgCmc').previousSibling.nodeValue = pkm ? 'Avg HP: ' : 'Avg CMC: ';
+    $('avgCmc').textContent = pkm ? (hn ? Math.round(hs / hn) : 0) : (nc ? (tc / nc).toFixed(2) : '0.00');
+    var mx = Math.max.apply(null, curve.concat([1]));
+    $('manaCurveContainer').innerHTML = pkm ? '' : curve.map(function (n, i) { return '<div class="curve-col" title="CMC ' + (i === 7 ? '7+' : i) + ': ' + n + '"><div class="curve-bar" style="height:' + Math.max(Math.round(n / mx * 36), 3) + 'px"></div><span class="curve-label">' + (i === 7 ? '7+' : i) + '</span></div>'; }).join('');
+    var vis = S.builderMode === 'visual';
+    $('boardContainer').innerHTML = !d.cards.length ? '<div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text-muted)">Deck is empty. Search cards above or click <strong>Import</strong>!</div>' :
+      Object.keys(cats).filter(function (k) { return cats[k].length; }).map(function (k) {
+        var list = cats[k].sort(function (a, b) { return a.cmc - b.cmc || a.name.localeCompare(b.name); });
+        var n = list.reduce(function (s, c) { return s + c.qty; }, 0);
+        return '<div class="category-column"><div class="column-header"><span>' + k + '</span><span class="column-badge">' + n + '</span></div><div class="' + (vis ? 'visual-card-grid' : '') + '">' + list.map(function (c) { return vis ? visualHtml(c) : sliceHtml(c); }).join('') + '</div></div>';
+      }).join('');
+    if (window.AD && AD.pk) AD.pk.afterRender(d);
+    if (window.AD && AD.tools) AD.tools.afterRender(d);
+  }
+  function btns(c) {
+    return '<button type="button" class="icon-btn" data-action="change-art" data-card-id="' + c.id + '">🖼️</button><button type="button" class="icon-btn" data-action="qty-minus" data-card-id="' + c.id + '">-</button><button type="button" class="icon-btn" data-action="qty-plus" data-card-id="' + c.id + '">+</button>';
+  }
+  function sliceHtml(c) {
+    return '<div class="card-slice" data-action="open-card-modal" data-card-id="' + c.id + '" data-img="' + esc(c.image) + '"><div class="card-slice-bg" style="background-image:url(\'' + esc(c.art_crop) + '\')"></div><div class="card-slice-gradient"></div>' +
+      '<div class="card-slice-left">' + (c.category ? '' : '<button type="button" class="icon-btn" data-action="toggle-cmdr" data-card-id="' + c.id + '">👑</button>') + '<span class="qty-badge">' + c.qty + '</span><span class="card-name-text">' + esc(c.name) + (c.locked ? ' 🔒' : '') + '</span>' + (c.legal === false ? '<span title="Not Standard legal" style="color:var(--danger);font-size:12px">⚠</span>' : '') + '</div>' +
+      '<div class="card-slice-right"><span class="card-cost">' + esc(c.mana_cost) + '</span><span class="card-price">' + money(c.price * c.qty) + '</span><div style="display:flex;gap:3px">' + btns(c) + '</div></div></div>';
+  }
+  function visualHtml(c) {
+    return '<div class="visual-card-item" data-action="open-card-modal" data-card-id="' + c.id + '"><img class="visual-card-img" src="' + esc(c.image) + '" alt="' + esc(c.name) + '"><div class="visual-card-overlay"><div style="display:flex;justify-content:space-between;align-items:center"><span style="background:var(--cyan);color:#000;font-weight:800;font-size:11px;padding:2px 6px;border-radius:10px">' + c.qty + 'x</span>' + (c.category ? (c.legal === false ? '<span title="Not Standard legal" style="color:#fff;background:var(--danger);font-size:10px;font-weight:800;padding:2px 5px;border-radius:8px">⚠ Illegal</span>' : '') : '<button type="button" class="icon-btn" data-action="toggle-cmdr" data-card-id="' + c.id + '">👑</button>') + '</div>' +
+      '<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:10px;font-weight:700">' + money(c.price * c.qty) + '</span><div style="display:flex;gap:3px">' + btns(c) + '</div></div></div></div>';
+  }
+
+  // ---------- hover preview ----------
+  function preview(e) {
+    var p = $('cardPreview'), el = e.target.closest && e.target.closest('.card-slice[data-img]');
+    if (!el || $('cardDetailModal').classList.contains('active')) { p.style.display = 'none'; return; }
+    if (p.getAttribute('src') !== el.getAttribute('data-img')) p.src = el.getAttribute('data-img');
+    p.style.display = 'block';
+    p.style.left = Math.min(e.clientX + 20, window.innerWidth - 270) + 'px';
+    p.style.top = Math.min(Math.max(e.clientY - 140, 10), window.innerHeight - 360) + 'px';
+  }
+
+  // ---------- quick search ----------
+  var qT;
+  function quickAdd(name) {
+    if (S.game === 'pokemon' && window.AD && AD.pk) { $('searchDropdown').style.display = 'none'; $('cardSearchInput').value = ''; AD.pk.quickAdd(name); return; }
+    $('searchDropdown').style.display = 'none'; $('cardSearchInput').value = ''; toast('Adding ' + name + '...');
+    sf('https://api.scryfall.com/cards/named?exact=' + encodeURIComponent(name))
+      .catch(function () { return sf('https://api.scryfall.com/cards/named?fuzzy=' + encodeURIComponent(name)); })
+      .then(function (p) { addToDeck(fromSf(p, 1)); save(); render(); toast('Added ' + p.name); })
+      .catch(function (e) { toast('Error: ' + e.message); });
+  }
+
+  // ---------- card detail modal ----------
+  var cur = null, faces = [], face = 0, curData = null;
+  function openCard(id) {
+    var d = deck(), i = d ? d.cards.findIndex(function (c) { return c.id === id; }) : -1;
+    if (i >= 0) showCard(i);
+  }
+  function showCard(i) {
+    var d = deck(); if (!d || i < 0 || i >= d.cards.length) return;
+    cur = d.cards[i]; face = 0; faces = [cur.image]; curData = null;
+    $('cdmCardName').textContent = cur.name;
+    $('cdmCardSubtitle').textContent = (cur.mana_cost || 'No Cost') + ' • ' + (cur.type || 'Card');
+    $('cdmScryfallLink').href = 'https://scryfall.com/search?q=' + encodeURIComponent('!"' + cur.name + '"');
+    $('cdmEdhrecLink').href = 'https://edhrec.com/cards/' + encodeURIComponent(cur.name.split(' // ')[0].toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, '-'));
+    $('cdmCardImg').src = cur.image; $('cdmFlipBtn').style.display = 'none';
+    $('cdmPriceVal').textContent = money(cur.price);
+    $('cdmBtnPrev').disabled = i === 0; $('cdmBtnNext').disabled = i === d.cards.length - 1;
+    $('cdmInfoType').textContent = cur.type || '—'; $('cdmInfoMana').textContent = cur.mana_cost || '—';
+    $('cdmInfoCmc').textContent = cur.cmc; $('cdmInfoSet').textContent = cur.set || '—';
+    $('cdmInfoCollector').textContent = cur.collector_number || '—';
+    $('cdmInfoOracle').textContent = cur.oracle_text || 'No oracle text found.';
+    $('cdmRulingsContainer').innerHTML = '';
+    cdmTab('options'); syncCdm(); openM('cardDetailModal'); $('cardPreview').style.display = 'none';
+    var id = cur.id;
+    sf('https://api.scryfall.com/cards/' + encodeURIComponent(id)).then(function (p) {
+      if (!cur || cur.id !== id) return; curData = p;
+      var f = p.card_faces;
+      if (f && f.length > 1 && f[0].image_uris && f[1].image_uris) { faces = [f[0].image_uris.normal, f[1].image_uris.normal]; $('cdmFlipBtn').style.display = 'block'; }
+    }).catch(function () {});
+  }
+  function syncCdm() {
+    if (!cur) return;
+    $('cdmQtyInput').value = cur.qty;
+    var b = $('cdmCmdrToggleBtn'); b.textContent = cur.isCommander ? '👑 Commander (Assigned)' : '👑 Set as Commander'; b.classList.toggle('is-commander', cur.isCommander);
+    var lb = $('cdmLockBtn'); if (lb) lb.textContent = cur.locked ? '🔓 Unlock Printing' : '🔒 Lock Printing';
+    $('cdmPrintDesc').textContent = (cur.set || 'N/A') + (cur.collector_number ? ' #' + cur.collector_number : '');
+  }
+  function cdmTab(t) {
+    document.querySelectorAll('.cdm-tab').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-tab') === t); });
+    document.querySelectorAll('.cdm-panel').forEach(function (p) { p.classList.toggle('active', p.id === 'cdmPanel-' + t); });
+    if (t === 'rulings' && cur) loadRulings();
+  }
+  function loadRulings() {
+    var box = $('cdmRulingsContainer'), ld = $('cdmRulingsLoader'), id = cur.id; box.innerHTML = ''; ld.style.display = 'block';
+    var p = curData ? Promise.resolve(curData) : sf('https://api.scryfall.com/cards/' + encodeURIComponent(id));
+    p.then(function (c) { return sf(c.rulings_uri); }).then(function (r) {
+      ld.style.display = 'none'; if (!cur || cur.id !== id) return;
+      box.innerHTML = (r.data && r.data.length) ? r.data.map(function (x) { return '<div class="cdm-ruling-item"><div class="cdm-ruling-date">' + esc(x.published_at) + '</div><div>' + esc(x.comment) + '</div></div>'; }).join('') : '<div style="color:var(--text-muted);font-size:12px">No official rulings for this card.</div>';
+    }).catch(function (e) { ld.style.display = 'none'; box.innerHTML = '<div style="color:var(--text-muted);font-size:12px">Could not load rulings: ' + esc(e.message) + '</div>'; });
+  }
+  function cdmQty(delta) {
+    if (!cur) return; var id = cur.id, n = cur.qty + delta;
+    if (n <= 0) { var nm = cur.name; qty(id, -cur.qty); closeM('cardDetailModal'); toast('Removed ' + nm); return; }
+    qty(id, delta); syncCdm();
+  }
+
+  // ---------- alternate art ----------
+  var artCard = null, prints = [];
+  function openArt(id) {
+    artCard = findCard(id); if (!artCard) return;
+    var box = $('printingsContainer'), ld = $('artLoadingMsg'); box.innerHTML = ''; ld.style.display = 'block'; openM('artModal');
+    sf('https://api.scryfall.com/cards/search?unique=prints&q=' + encodeURIComponent('!"' + artCard.name.split(' // ')[0] + '"')).then(function (j) {
+      ld.style.display = 'none'; var raw = j.data || []; prints = raw.map(function (p) { return fromSf(p); });
+      showArt(prints.map(function (c, i) { return { i: i, img: c.image, set: c.set, setName: raw[i].set_name || '', num: c.collector_number, price: c.price }; }), pickPrint);
+    }).catch(function (e) { ld.style.display = 'none'; box.innerHTML = '<div style="color:var(--danger)">Error: ' + esc(e.message) + '</div>'; });
+  }
+  // generic set-filterable art picker (used by MTG here and by the Pokémon module)
+  var artItems = [], artPickFn = null;
+  function showArt(items, pick) {
+    artItems = items; artPickFn = pick; $('artFilterText').value = '';
+    var seen = {}, opts = [];
+    items.forEach(function (x) { if (x.set && !seen[x.set]) { seen[x.set] = 1; opts.push(x); } });
+    opts.sort(function (a, b) { return (a.setName || a.set).localeCompare(b.setName || b.set); });
+    $('artSet').innerHTML = '<option value="">All sets (' + opts.length + ')</option>' + opts.map(function (x) { return '<option value="' + esc(x.set) + '">' + esc(x.setName || x.set) + ' (' + esc(x.set) + ')</option>'; }).join('');
+    renderArt();
+  }
+  function renderArt() {
+    var sel = $('artSet').value, t = $('artFilterText').value.trim().toLowerCase();
+    var list = artItems.filter(function (x) { return (!sel || x.set === sel) && (!t || (x.set + ' ' + x.setName).toLowerCase().indexOf(t) >= 0); });
+    $('printingsContainer').innerHTML = list.map(function (x) {
+      return '<div class="printing-card" data-action="art-pick" data-idx="' + x.i + '"><img src="' + esc(x.img) + '" loading="lazy" alt=""><div class="printing-info"><span style="font-weight:700;color:#fff">' + esc(x.set) + ' #' + esc(x.num) + '</span>' + (x.setName ? '<span style="color:var(--text-muted)">' + esc(x.setName) + '</span>' : '') + (x.price ? '<span style="color:var(--cyan);font-weight:700">' + money(x.price) + '</span>' : '') + '</div></div>';
+    }).join('') || '<div style="color:var(--text-muted);padding:20px">No printings match that set.</div>';
+  }
+  function pickPrint(i) {
+    var p = prints[i], d = deck(); if (!p || !artCard) return;
+    var dupe = d.cards.filter(function (c) { return c.id === p.id && c !== artCard; })[0];
+    if (dupe) { dupe.qty += artCard.qty; dupe.isCommander = dupe.isCommander || artCard.isCommander; d.cards = d.cards.filter(function (c) { return c !== artCard; }); }
+    else ['id', 'image', 'art_crop', 'set', 'collector_number', 'price'].forEach(function (k) { artCard[k] = p[k]; });
+    closeM('artModal'); save(); render(); toast('Updated art to ' + p.set);
+  }
+
+  // ---------- advanced search ----------
+  var advList = [], advNext = null, advColors = {};
+  function advQuery() {
+    var q = [], v = function (id) { return $(id).value.trim(); };
+    if (v('advCardName')) q.push(v('advCardName').split(/\s+/).map(function (w) { return 'name:' + w; }).join(' '));
+    if (v('advCardOracle')) q.push($('advOracleMode').value === 'exact' ? 'o:"' + v('advCardOracle').replace(/"/g, '') + '"' : v('advCardOracle').split(/\s+/).map(function (w) { return 'o:' + w; }).join(' '));
+    if (v('advCardType')) q.push(v('advCardType').split(/\s+/).map(function (w) { return 't:' + w; }).join(' '));
+    var sel = Object.keys(advColors).filter(function (k) { return advColors[k]; }), letters = sel.filter(function (k) { return k !== 'C'; }).join('').toLowerCase() || (sel.length ? 'c' : '');
+    if (letters) { var m = $('advColorMode').value; q.push(m === 'id_lte' ? 'id<=' + letters : m === 'c_exact' ? 'c=' + letters : m === 'c_gte' ? 'c>=' + letters : 'c<=' + letters); }
+    if (v('advCmcMin') !== '') q.push('mv>=' + v('advCmcMin'));
+    if (v('advCmcMax') !== '') q.push('mv<=' + v('advCmcMax'));
+    var rs = Array.prototype.filter.call(document.querySelectorAll('.advRarity'), function (c) { return c.checked; }).map(function (c) { return 'r:' + c.value; });
+    if (rs.length && rs.length < 4) q.push('(' + rs.join(' or ') + ')');
+    if (v('advCustomQuery')) q.push(v('advCustomQuery'));
+    return q.join(' ');
+  }
+  function advRun(more) {
+    var url;
+    if (more && advNext) url = advNext;
+    else {
+      var q = advQuery(); if (!q) { toast('Add at least one filter first.'); return; }
+      var o = { edhrec: 'edhrec', usd: 'usd&dir=desc', cmc: 'cmc', name: 'name', released: 'released&dir=desc' }[$('advSortOrder').value];
+      url = 'https://api.scryfall.com/cards/search?unique=cards&order=' + o + '&q=' + encodeURIComponent(q); advList = [];
+    }
+    $('advLoadingIndicator').style.display = 'inline';
+    sf(url).then(function (j) {
+      $('advLoadingIndicator').style.display = 'none';
+      advList = advList.concat((j.data || []).map(function (p) { return fromSf(p); })); advNext = j.has_more ? j.next_page : null;
+      $('advResultCount').textContent = j.total_cards + ' cards found'; $('btnAdvLoadMore').style.display = advNext ? 'inline-flex' : 'none'; advGrid();
+    }).catch(function (e) {
+      $('advLoadingIndicator').style.display = 'none'; advNext = null; $('btnAdvLoadMore').style.display = 'none';
+      $('advResultCount').textContent = /404/.test(e.message) ? 'No cards matched those filters.' : 'Search error: ' + e.message; if (!more) $('advResultsGrid').innerHTML = '';
+    });
+  }
+  function advGrid() {
+    var crop = S.advArtMode === 'crop';
+    if (advList.length) $('advResultsGrid').innerHTML = advList.map(function (c, i) {
+      return '<div class="adv-card-item"><div class="adv-card-art-wrap"><img class="adv-card-art' + (crop ? ' crop-mode' : '') + '" loading="lazy" src="' + esc(crop ? c.art_crop : c.image) + '" alt=""></div><div class="adv-card-info"><div class="adv-card-name" title="' + esc(c.name) + '">' + esc(c.name) + '</div><div class="adv-card-meta"><span>' + esc(c.mana_cost) + '</span><span>' + money(c.price) + '</span></div><div class="adv-card-actions"><button type="button" class="cyan" data-action="adv-add" data-idx="' + i + '">+ Add</button></div></div></div>';
+    }).join('');
+    $('btnViewFull').classList.toggle('is-commander', !crop); $('btnViewCrop').classList.toggle('is-commander', crop);
+  }
+  function setPills() { document.querySelectorAll('.color-pill').forEach(function (p) { p.classList.toggle('active', !!advColors[p.getAttribute('data-color')]); }); }
+
+  // ---------- import ----------
+  function parseLine(l) {
+    var s = l.trim(); if (!s || s[0] === '#' || s.indexOf('//') === 0) return null;
+    var cm = /(\/\/|\*)\s*(commander|cmdr)/i.test(s); s = s.replace(/(\/\/|\*)\s*(commander|cmdr)\s*\*?/gi, '').trim();
+    var m = s.match(/^(\d+)x?\s+(.+?)(?:\s+[\[\(]([A-Za-z0-9]{3,5})[\]\)]\s*(\S+)?)?$/i);
+    return m ? { qty: parseInt(m[1], 10), name: m[2].trim(), set: m[3] ? m[3].toLowerCase() : null, num: m[4] ? m[4].toLowerCase() : null, cmdr: cm } : { qty: 1, name: s, set: null, num: null, cmdr: cm };
+  }
+  function runImport() {
+    var items = $('importText').value.split(/\r?\n/).map(parseLine).filter(Boolean), st = $('statusMsg');
+    if (!items.length) { st.style.color = 'var(--danger)'; st.textContent = 'Paste deck lines first.'; return; }
+    var btn = document.querySelector('[data-action="run-import"]'); btn.disabled = true; st.style.color = 'var(--cyan)'; st.textContent = 'Resolving cards with Scryfall...';
+    var ids = items.map(function (i) { return i.set && i.num ? { set: i.set, collector_number: i.num } : i.set ? { name: i.name, set: i.set } : { name: i.name }; });
+    var found = [], chain = Promise.resolve();
+    for (var i = 0; i < ids.length; i += 75) (function (chunk) {
+      chain = chain.then(function () { return sf('https://api.scryfall.com/cards/collection', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ identifiers: chunk }) }); })
+        .then(function (j) { found = found.concat(j.data || []); return new Promise(function (r) { setTimeout(r, 100); }); });
+    })(ids.slice(i, i + 75));
+    chain.then(function () {
+      var map = {};
+      found.forEach(function (c) { map[c.name.toLowerCase()] = c; if (c.card_faces && c.card_faces[0]) map[c.card_faces[0].name.toLowerCase()] = c; map[c.set + ':' + c.collector_number.toLowerCase()] = c; });
+      var miss = [];
+      items.forEach(function (it) { var c = map[it.set && it.num ? it.set + ':' + it.num : ''] || map[it.name.toLowerCase()]; if (c) addToDeck(fromSf(c, it.qty, it.cmdr)); else miss.push(it.name); });
+      save(); render();
+      if (miss.length) { st.style.color = 'var(--gold)'; st.textContent = 'Imported, but not found: ' + miss.join(', '); }
+      else { closeM('importModal'); $('importText').value = ''; toast('Cards imported!'); }
+    }).catch(function (e) { st.style.color = 'var(--danger)'; st.textContent = 'Import error: ' + e.message; }).then(function () { btn.disabled = false; });
+  }
+
+  // ---------- action dispatcher ----------
+  var A = {
+    'go-home': function () { S.currentView = 'home'; save(); render(); },
+    'open-deck': function (b) { S.activeDeckId = b.dataset.deckId; S.currentView = 'builder'; save(); render(); },
+    'clone-deck': function (b) { var s = S.decks.filter(function (d) { return d.id === b.dataset.deckId; })[0]; if (!s) return; var c = cd(JSON.parse(JSON.stringify(s))); c.id = 'deck_' + Date.now(); c.name += ' (Copy)'; S.decks.push(c); save(); render(); toast('Deck cloned'); },
+    'delete-deck': function (b) { removeDeck(b.dataset.deckId); },
+    'delete-active-deck': function () { removeDeck(S.activeDeckId); },
+    'confirm-yes': function () { var f = pending; closeM('confirmModal'); if (f) f(); },
+    'toggle-view': function () { S.builderMode = S.builderMode === 'slices' ? 'visual' : 'slices'; save(); render(); },
+    'open-modal': function (b) { openM(b.dataset.modal); },
+    'close-modal': function (b) { closeM(b.dataset.modal); },
+    'create-deck': createDeck,
+    'save-deck-settings': function () { var d = deck(); d.name = $('editDeckName').value.trim() || d.name; d.format = $('editDeckFormat').value; closeM('deckSettingsModal'); save(); render(); toast('Settings saved'); },
+    'export-deck': function () { $('exportText').value = exportText(); openM('exportModal'); $('exportText').select(); },
+    'copy-export': function () { var t = $('exportText'); t.select(); var ok = false; try { ok = document.execCommand('copy'); } catch (e) {} if (!ok && navigator.clipboard) navigator.clipboard.writeText(t.value).then(function () { toast('Copied!'); }, function () {}); else toast(ok ? 'Copied!' : 'Press Ctrl+C to copy'); },
+    'run-import': runImport,
+    'open-card-modal': function (b) { openCard(b.dataset.cardId); },
+    'toggle-cmdr': function (b) { toggleCmdr(b.dataset.cardId); },
+    'qty-plus': function (b) { qty(b.dataset.cardId, 1); },
+    'qty-minus': function (b) { qty(b.dataset.cardId, -1); },
+    'change-art': function (b) { openArt(b.dataset.cardId); },
+    'pick-print': function (b) { pickPrint(+b.dataset.idx); },
+    'art-pick': function (b) { if (artPickFn) artPickFn(+b.dataset.idx); },
+    'cdm-lock': function () { if (cur) { cur.locked = !cur.locked; save(); render(); syncCdm(); toast(cur.locked ? '🔒 Printing locked' : 'Unlocked'); } },
+    'cdm-close': function () { closeM('cardDetailModal'); },
+    'cdm-tab': function (b) { cdmTab(b.dataset.tab); },
+    'cdm-flip': function () { if (faces.length > 1) { face = face ? 0 : 1; $('cdmCardImg').src = faces[face]; } },
+    'cdm-prev': function () { var d = deck(); if (cur) showCard(d.cards.indexOf(cur) - 1); },
+    'cdm-next': function () { var d = deck(); if (cur) showCard(d.cards.indexOf(cur) + 1); },
+    'cdm-qty-inc': function () { cdmQty(1); },
+    'cdm-qty-dec': function () { cdmQty(-1); },
+    'cdm-clone': function () { if (cur) { cdmQty(1); toast('Added a copy'); } },
+    'cdm-delete': function () { if (cur) { var n = cur.name; qty(cur.id, -cur.qty); closeM('cardDetailModal'); toast('Removed ' + n); } },
+    'cdm-toggle-cmdr': function () { if (cur) { toggleCmdr(cur.id); syncCdm(); } },
+    'cdm-change-art': function () { if (cur) { var id = cur.id; closeM('cardDetailModal'); openArt(id); } },
+    'cdm-set-cover': function () { if (cur) { deck().bannerArt = cur.art_crop || cur.image; save(); render(); toast('Deck cover updated'); } },
+    'open-adv-search': function () { openM('advSearchModal'); },
+    'run-adv-search': function () { advRun(false); },
+    'load-more-adv': function () { advRun(true); },
+    'reset-adv-filters': function () {
+      document.querySelectorAll('#advSearchModal input[type=text], #advSearchModal input[type=number]').forEach(function (i) { i.value = ''; });
+      document.querySelectorAll('.advRarity').forEach(function (c) { c.checked = true; }); advColors = {}; setPills();
+    },
+    'toggle-color-pill': function (b) { var c = b.dataset.color; advColors[c] = !advColors[c]; setPills(); },
+    'match-cmdr-identity': function () {
+      var d = deck(), set = {}; (d ? d.cards : []).filter(function (c) { return c.isCommander; }).forEach(function (c) { c.color_identity.split('').forEach(function (x) { set[x] = true; }); });
+      if (!Object.keys(set).length) { if (d && d.cards.some(function (c) { return c.isCommander; })) set.C = true; else { toast('Assign a commander first.'); return; } }
+      advColors = set; $('advColorMode').value = 'id_lte'; setPills();
+    },
+    'toggle-art-crop-mode': function (b) { S.advArtMode = b.dataset.mode; save(); advGrid(); },
+    'adv-add': function (b) { var c = advList[+b.dataset.idx]; if (c) { addToDeck(cc(c)); save(); render(); toast('Added ' + c.name); } }
+  };
+  document.addEventListener('click', function (e) {
+    try {
+      if (e.target.classList && e.target.classList.contains('modal-overlay')) { closeM(e.target.id); return; }
+      if (!e.target.closest('.search-wrapper')) $('searchDropdown').style.display = 'none';
+      var si = e.target.closest('.search-item'); if (si) { quickAdd(si.getAttribute('data-card-name')); return; }
+      var b = e.target.closest('[data-action]'); if (b && A[b.getAttribute('data-action')]) A[b.getAttribute('data-action')](b, e);
+    } catch (err) { console.error(err); toast('Error: ' + err.message); }
+  });
+  document.addEventListener('mouseover', preview); document.addEventListener('mousemove', function (e) { if ($('cardPreview').style.display === 'block') preview(e); });
+
+  function wire() {
+    $('deckSelect').addEventListener('change', function (e) { S.activeDeckId = e.target.value; save(); render(); });
+    $('cdmQtyInput').addEventListener('change', function (e) { if (cur) cdmQty((parseInt(e.target.value, 10) || 1) - cur.qty); });
+    var inp = $('cardSearchInput'), dd = $('searchDropdown');
+    inp.addEventListener('input', function () {
+      clearTimeout(qT); var q = inp.value.trim(); if (q.length < 2) { dd.style.display = 'none'; return; }
+      qT = setTimeout(function () {
+        (S.game === 'pokemon' && window.AD && AD.pk ? AD.pk.suggest(q) : sf('https://api.scryfall.com/cards/autocomplete?q=' + encodeURIComponent(q))).then(function (j) {
+          dd.innerHTML = (j.data || []).slice(0, 8).map(function (n) { return '<div class="search-item" data-card-name="' + esc(n) + '"><span>' + esc(n) + '</span><span class="search-add-badge">+ Add</span></div>'; }).join('') || '<div style="padding:10px;color:var(--text-muted);font-size:12px">No matches</div>';
+          dd.style.display = 'block';
+        }).catch(function () {});
+      }, 200);
+    });
+    inp.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { var f = dd.querySelector('.search-item'); if (f && dd.style.display !== 'none') quickAdd(f.getAttribute('data-card-name')); else if (inp.value.trim()) quickAdd(inp.value.trim()); }
+      else if (e.key === 'Escape') dd.style.display = 'none';
+    });
+  }
+
+  window.AD = { S: S, A: A, $: $, esc: esc, money: money, sf: sf, save: save, render: render, toast: toast, openM: openM, closeM: closeM, deck: deck, findCard: findCard, addToDeck: addToDeck, cc: cc, fromSf: fromSf, showArt: showArt, qty: qty, ask: ask, pk: null };
+
+  // ---------- startup ----------
+  function adopt(raw) {
+    var p = JSON.parse(raw);
+    S.game = p.game === 'pokemon' ? 'pokemon' : 'mtg';
+    S.currentView = p.currentView || 'home'; S.builderMode = p.builderMode || 'slices'; S.advArtMode = p.advArtMode || 'full';
+    S.decks = Array.isArray(p.decks) ? p.decks.map(cd) : []; S.activeDeckId = p.activeDeckId || null; S.savedAt = Number(p.savedAt) || 0;
+  }
+  function init() {
+    try { var raw = store.get(KEY); if (raw) adopt(raw); } catch (e) { console.warn('Local load failed', e); }
+    if (!S.decks.length) { var d = cd({ name: 'My Commander Deck', format: 'Commander' }); S.decks = [d]; S.activeDeckId = d.id; }
+    ensureGameDeck();
+    var sw = document.createElement('select'); sw.id = 'gameSwitch'; sw.innerHTML = '<option value="mtg">Magic: The Gathering</option><option value="pokemon">Pokémon TCG</option>';
+    var na = document.querySelector('.nav-actions'); na.insertBefore(sw, na.firstChild); sw.addEventListener('change', function () { setGame(sw.value); });
+    var pc = $('printingsContainer'), af = document.createElement('div'); af.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+    af.innerHTML = '<select id="artSet" style="flex:1;min-width:180px"><option value="">All sets</option></select><input type="text" id="artFilterText" placeholder="Filter by set name or code..." style="flex:1;min-width:180px">';
+    pc.parentNode.insertBefore(af, pc); $('artSet').addEventListener('change', renderArt); $('artFilterText').addEventListener('input', renderArt);
+    var al = document.querySelector('#cdmPanel-options .cdm-action-list'); if (al) al.insertAdjacentHTML('beforeend', '<button type="button" id="cdmLockBtn" data-action="cdm-lock">🔒 Lock Printing</button>');
+    wire(); advGrid(); render();
+    if (hasGS()) google.script.run.withSuccessHandler(function (raw) {
+      try {
+        if (!raw) { if (S.decks.some(function (d) { return d.cards.length; })) save(); return; }
+        var p = JSON.parse(raw);
+        if ((Number(p.savedAt) || 0) > S.savedAt) { adopt(raw); store.set(KEY, raw); render(); toast('Loaded saved decks'); }
+      } catch (e) { console.warn('Server load failed', e); }
+    }).withFailureHandler(function (e) { console.warn('Server load failed', e); }).loadAppState();
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>
