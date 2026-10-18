@@ -1,0 +1,258 @@
+<script>
+(function () {
+  'use strict';
+  if (!window.AD) return;
+  var AD = window.AD, $ = AD.$, esc = AD.esc, money = AD.money, API = 'https://api.tcgdex.net/v2/en/';
+  var norm = function (s) { return String(s || '').toLowerCase().replace(/[’`]/g, "'").trim(); };
+  var img = function (b, q) { return b ? b + '/' + (q || 'high') + '.webp' : ''; };
+  function get(path) { return fetch(API + path).then(function (r) { if (!r.ok) throw new Error('TCGdex ' + r.status); return r.json(); }); }
+  function setCode(d) { var s = d.set || {}, a = s.abbreviation || {}; return String(a.official || a.normal || s.id || '').toUpperCase(); }
+  function priceOf(d) {
+    var p = d.pricing || {}, t = p.tcgplayer, c = p.cardmarket, v = 0;
+    if (t) Object.keys(t).forEach(function (k) { var o = t[k]; if (!v && o && typeof o === 'object') v = Number(o.marketPrice || o.midPrice || 0) || 0; });
+    if (!v && c) v = Number(c.trend || c.avg || 0) || 0; // Cardmarket is EUR; only used when no TCGplayer price
+    return v;
+  }
+  function fromDex(d, qty) {
+    var cat = d.category || 'Pokemon', types = d.types || [], im = img(d.image, 'high');
+    var basic = cat === 'Energy' && (d.energyType === 'Normal' || /^(basic )?(grass|fire|water|lightning|psychic|fighting|darkness|metal|fairy) energy$/i.test(d.name));
+    var type = cat === 'Pokemon' ? ['Pokémon', d.stage, types.join('/')].filter(Boolean).join(' — ') : [cat, d.trainerType || d.energyType].filter(Boolean).join(' — ');
+    return AD.cc({ id: d.id, name: d.name, qty: qty || 1, type: type, mana_cost: types.join('/'), set: setCode(d), collector_number: d.localId,
+      image: im, art_crop: im, price: priceOf(d), category: cat,
+      oracle_text: d.effect || (d.attacks || []).map(function (a) { return a.name + (a.damage ? ' (' + a.damage + ')' : '') + ': ' + (a.effect || ''); }).join('\n'),
+      legal: d.legal ? !!d.legal.standard : null,
+      pk: { hp: d.hp, types: types, stage: d.stage, evolveFrom: d.evolveFrom, attacks: d.attacks || [], abilities: d.abilities || [], weaknesses: d.weaknesses || [], resistances: d.resistances || [],
+        retreat: d.retreat, effect: d.effect, trainerType: d.trainerType, energyType: d.energyType, rarity: d.rarity, illustrator: d.illustrator, setName: d.set && d.set.name, reg: d.regulationMark, basic: basic } });
+  }
+
+  // ---------- rules ----------
+  function copies(d, name) { return d.cards.reduce(function (s, c) { return s + (norm(c.name) === norm(name) ? c.qty : 0); }, 0); }
+  function add(c, force) {
+    var d = AD.deck();
+    if (!force && !(c.pk && c.pk.basic) && copies(d, c.name) + c.qty > 4) { AD.toast('Max 4 copies of ' + c.name); return false; }
+    AD.addToDeck(c); return true;
+  }
+  function afterRender(d) {
+    var el = $('pkValidation');
+    if (!el) { el = document.createElement('div'); el.id = 'pkValidation'; document.querySelector('.deck-meta').appendChild(el); }
+    if (d.game !== 'pokemon') { el.style.display = 'none'; return; }
+    el.style.display = 'block';
+    if (d.format !== 'Standard') { el.innerHTML = '<span style="color:var(--text-muted)">Casual deck — no rules enforced</span>'; return; }
+    var n = d.cards.reduce(function (s, c) { return s + c.qty; }, 0), bad = [], seen = {}, over = [], ill = [];
+    if (n !== 60) bad.push(n + '/60 cards');
+    d.cards.forEach(function (c) { var k = norm(c.name); if (!seen[k]) { seen[k] = 1; if (!(c.pk && c.pk.basic) && copies(d, c.name) > 4) over.push(c.name); } if (c.legal === false) ill.push(c.name); });
+    if (over.length) bad.push('over 4 copies: ' + over.join(', '));
+    if (ill.length) bad.push('not Standard-legal: ' + ill.join(', '));
+    if (d.cards.length && !d.cards.some(function (c) { return c.pk && /^basic$/i.test(c.pk.stage || '') && c.category === 'Pokemon'; })) bad.push('no Basic Pokémon');
+    el.innerHTML = bad.length ? '<span style="color:var(--gold)">⚠ ' + esc(bad.join(' · ')) + '</span>' : '<span style="color:var(--success)">✓ Standard-ready</span>';
+  }
+
+  // ---------- quick search ----------
+  function suggest(q) {
+    return get('cards?name=' + encodeURIComponent(q) + '&pagination:page=1&pagination:itemsPerPage=40').then(function (l) {
+      var seen = {}, out = []; l.forEach(function (x) { if (!seen[norm(x.name)]) { seen[norm(x.name)] = 1; out.push(x.name); } }); return { data: out };
+    });
+  }
+  function newestLegal(name) {
+    return get('cards?name=' + encodeURIComponent(name)).then(function (l) {
+      var m = l.filter(function (x) { return norm(x.name) === norm(name); }); if (!m.length) throw new Error('Card not found');
+      return Promise.all(m.slice(-3).reverse().map(function (x) { return get('cards/' + encodeURIComponent(x.id)); })).then(function (ds) {
+        return ds.filter(function (d) { return d.legal && d.legal.standard; })[0] || ds[0];
+      });
+    });
+  }
+  function quickAdd(name) {
+    AD.toast('Adding ' + name + '...');
+    newestLegal(name).then(function (d) { if (add(fromDex(d, 1))) { AD.save(); AD.render(); AD.toast('Added ' + d.name); } }).catch(function (e) { AD.toast('Error: ' + e.message); });
+  }
+
+  // ---------- modals (injected) ----------
+  var opts = function (a) { return '<option value="">Any</option>' + a.map(function (x) { return '<option>' + x + '</option>'; }).join(''); };
+  var TYPES = ['Colorless', 'Darkness', 'Dragon', 'Fairy', 'Fighting', 'Fire', 'Grass', 'Lightning', 'Metal', 'Psychic', 'Water'];
+  var STAGES = ['Basic', 'Stage1', 'Stage2', 'VMAX', 'VSTAR', 'MEGA', 'BREAK', 'V-UNION', 'RESTORED', 'LEVEL-UP'];
+  var lab = function (t) { return '<label>' + t + '</label>'; };
+  document.body.insertAdjacentHTML('beforeend',
+    '<div class="modal-overlay" id="pkSearchModal"><div class="modal modal-full"><div style="display:flex;justify-content:space-between;align-items:center"><h3>🔍 Pokémon Card Search</h3><button type="button" data-action="close-modal" data-modal="pkSearchModal">✕ Close</button></div>' +
+    '<div class="adv-search-layout"><div class="adv-search-filters">' +
+    '<div class="adv-group">' + lab('Card Name') + '<input type="text" id="pkName" placeholder="e.g. Pikachu, Boss\'s Orders"></div>' +
+    '<div class="adv-group">' + lab('Category') + '<select id="pkCat"><option value="">Any</option><option value="Pokemon">Pokémon</option><option value="Trainer">Trainer</option><option value="Energy">Energy</option></select></div>' +
+    '<div class="adv-group">' + lab('Type') + '<select id="pkType">' + opts(TYPES) + '</select></div>' +
+    '<div class="adv-group">' + lab('Stage') + '<select id="pkStage">' + opts(STAGES) + '</select></div>' +
+    '<div class="adv-group">' + lab('Set') + '<select id="pkSet"><option value="">Any (loading sets…)</option></select></div>' +
+    '<div class="adv-group">' + lab('Rarity') + '<input type="text" id="pkRarity" placeholder="e.g. Rare, Illustration"></div>' +
+    '<div class="adv-group"><label style="display:flex;gap:6px;align-items:center;text-transform:none"><input type="checkbox" id="pkLegal" style="width:auto"> Standard-legal only</label></div>' +
+    '<div style="display:flex;gap:8px;margin-top:8px"><button type="button" class="cyan" style="flex:1;justify-content:center" data-action="pk-search">Search</button><button type="button" data-action="pk-reset">Reset</button></div></div>' +
+    '<div class="adv-search-results-pane"><div class="adv-results-header"><div><span id="pkCount" style="font-weight:700;color:var(--text-muted);font-size:13px">Set filters and click Search</span><span id="pkLoading" style="display:none;color:var(--cyan);font-weight:700;font-size:13px;margin-left:8px">Searching TCGdex...</span></div></div>' +
+    '<div class="adv-results-grid" id="pkResults"></div><div style="padding-top:10px;display:flex;justify-content:center"><button type="button" class="primary" id="pkMore" style="display:none" data-action="pk-more">Load More Cards</button></div></div></div></div></div>' +
+    '<div class="modal-overlay" id="pkDetailModal" style="z-index:500;background:rgba(4,7,12,.88)"><div class="cdm-shell"><div class="cdm-header"><div class="cdm-header-left"><button type="button" class="icon-btn" data-action="close-modal" data-modal="pkDetailModal" style="font-size:14px;padding:4px 8px">✕</button><div class="cdm-title-area"><span class="cdm-title" id="pkDName"></span><span class="cdm-subtitle" id="pkDSub"></span></div></div></div>' +
+    '<div class="cdm-body"><div class="cdm-left-pane"><div class="cdm-card-image-wrap"><img id="pkDImg" class="cdm-card-image" src="" alt=""></div><div class="cdm-prices-row"><div class="cdm-price-pill">Price: <span id="pkDPrice"></span></div></div></div><div class="cdm-right-pane" id="pkDBody"></div></div></div></div>');
+  var setsLoaded = false;
+  function loadSets() {
+    if (setsLoaded) return; setsLoaded = true;
+    get('sets').then(function (l) { $('pkSet').innerHTML = '<option value="">Any</option>' + l.slice().reverse().map(function (s) { return '<option value="' + esc(s.id) + '">' + esc(s.name) + ' (' + esc(s.id) + ')</option>'; }).join(''); })
+      .catch(function () { setsLoaded = false; $('pkSet').innerHTML = '<option value="">Any</option>'; });
+  }
+
+  // ---------- search ----------
+  var page = 1, PER = 40;
+  function runSearch(more) {
+    var v = function (id) { return $(id).value.trim(); }, p = [], put = function (k, x) { if (x) p.push(k + '=' + encodeURIComponent(x)); };
+    if (more) page++; else page = 1;
+    put('name', v('pkName')); put('category', v('pkCat')); put('types', v('pkType')); put('stage', v('pkStage')); put('rarity', v('pkRarity')); if (v('pkSet')) put('id', v('pkSet') + '-');
+    if ($('pkLegal').checked) p.push('legal.standard=true');
+    if (!p.length) { AD.toast('Add at least one filter first.'); return; }
+    p.push('pagination:page=' + page, 'pagination:itemsPerPage=' + PER);
+    $('pkLoading').style.display = 'inline';
+    get('cards?' + p.join('&')).then(function (l) {
+      $('pkLoading').style.display = 'none';
+      var html = l.map(function (c) {
+        return '<div class="adv-card-item"><div class="adv-card-art-wrap"><img class="adv-card-art" loading="lazy" src="' + esc(img(c.image, 'low')) + '" alt=""></div><div class="adv-card-info"><div class="adv-card-name" title="' + esc(c.name) + '">' + esc(c.name) + '</div><div class="adv-card-meta"><span>' + esc(c.id) + '</span></div><div class="adv-card-actions"><button type="button" class="cyan" data-action="pk-add" data-id="' + esc(c.id) + '">+ Add</button><button type="button" data-action="pk-info" data-id="' + esc(c.id) + '">Info</button></div></div></div>';
+      }).join('');
+      if (more) $('pkResults').insertAdjacentHTML('beforeend', html); else $('pkResults').innerHTML = html || '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-muted)">No cards matched.</div>';
+      $('pkCount').textContent = ((page - 1) * PER + l.length) + (l.length === PER ? '+' : '') + ' cards shown';
+      $('pkMore').style.display = l.length === PER ? 'inline-flex' : 'none';
+    }).catch(function (e) { $('pkLoading').style.display = 'none'; $('pkCount').textContent = 'Search error: ' + e.message; $('pkMore').style.display = 'none'; });
+  }
+
+  // ---------- detail ----------
+  var curC = null, inDeck = false;
+  var row = function (k, v) { return (v || v === 0) ? '<div class="cdm-info-row"><strong>' + k + '</strong><span>' + esc(v) + '</span></div>' : ''; };
+  function showDetail(c, deckCard) {
+    curC = c; inDeck = deckCard; var p = c.pk || {};
+    $('pkDName').textContent = c.name; $('pkDSub').textContent = c.type; $('pkDImg').src = c.image; $('pkDPrice').textContent = c.price ? money(c.price) : 'N/A';
+    var wr = function (a) { return (a || []).map(function (w) { return w.type + ' ' + w.value; }).join(', '); };
+    var legal = c.legal === true ? 'Standard legal' : c.legal === false ? '⚠ Not Standard legal' : 'Unknown';
+    var h = '<div class="cdm-info-grid">' + row('HP', p.hp) + row('Type', (p.types || []).join(' / ')) + row('Evolves From', p.evolveFrom) + row('Retreat', p.retreat) + row('Weakness', wr(p.weaknesses)) + row('Resistance', wr(p.resistances)) +
+      row('Set', (p.setName || '') + ' (' + c.set + ' #' + c.collector_number + ')') + row('Rarity', p.rarity) + row('Illustrator', p.illustrator) + row('Regulation', p.reg) + row('Legality', legal) + '</div>';
+    (p.abilities || []).forEach(function (a) { h += '<div class="cdm-ruling-item"><div class="cdm-ruling-date">ABILITY' + (a.type ? ' · ' + esc(a.type) : '') + '</div><b>' + esc(a.name) + '</b><div>' + esc(a.effect) + '</div></div>'; });
+    (p.attacks || []).forEach(function (a) { h += '<div class="cdm-ruling-item"><div class="cdm-ruling-date">' + esc((a.cost || []).join(' · ') || 'No cost') + '</div><b>' + esc(a.name) + '</b>' + (a.damage ? ' — ' + esc(a.damage) : '') + (a.effect ? '<div>' + esc(a.effect) + '</div>' : '') + '</div>'; });
+    if (p.effect) h += '<div class="cdm-oracle-preview">' + esc(p.effect) + '</div>';
+    h += '<div class="cdm-group-box"><span class="cdm-group-title">' + (deckCard ? 'In Deck: ' + c.qty : 'Not in deck') + '</span><div class="cdm-action-list">' + (deckCard ?
+      '<div style="display:flex;gap:6px"><button type="button" class="icon-btn" data-action="pk-qty" data-d="-1">-</button><button type="button" class="icon-btn" data-action="pk-qty" data-d="1">+</button></div><button type="button" data-action="pk-art">🖼️ Select Alternate Art</button><button type="button" data-action="pk-lock">' + (c.locked ? '🔓 Unlock Printing' : '🔒 Lock Printing') + '</button><button type="button" data-action="pk-cover">🖼️ Set Deck Cover Art</button><button type="button" class="danger" data-action="pk-remove">🗑️ Remove from Deck</button>' :
+      '<button type="button" class="cyan" data-action="pk-add-cur">+ Add to Deck</button>') + '</div></div>';
+    $('pkDBody').innerHTML = h; AD.openM('pkDetailModal'); $('cardPreview').style.display = 'none';
+  }
+  function openCard(id, fromSearch) {
+    var c = AD.findCard(id); if (c) { showDetail(c, true); return; }
+    get('cards/' + encodeURIComponent(id)).then(function (d) { var n = fromDex(d, 1); var e = AD.findCard(n.id); showDetail(e || n, !!e); }).catch(function (e) { AD.toast('Error: ' + e.message); });
+  }
+
+  // ---------- alternate art ----------
+  var artFor = null, prints = [], setNamesP = null;
+  function setMap() {
+    if (!setNamesP) setNamesP = get('sets').then(function (l) { var m = {}; l.forEach(function (s) { m[s.id] = s.name; }); return m; }).catch(function () { setNamesP = null; return {}; });
+    return setNamesP;
+  }
+  function openArt(id) {
+    artFor = AD.findCard(id); if (!artFor) return;
+    var box = $('printingsContainer'), ld = $('artLoadingMsg'); box.innerHTML = ''; ld.style.display = 'block'; AD.openM('artModal');
+    Promise.all([get('cards?name=' + encodeURIComponent(artFor.name)), setMap()]).then(function (r) {
+      var l = r[0], names = r[1]; ld.style.display = 'none'; prints = l.filter(function (x) { return norm(x.name) === norm(artFor.name); }).reverse();
+      AD.showArt(prints.map(function (x, i) { var sid = x.id.split('-')[0]; return { i: i, img: img(x.image, 'low'), set: sid.toUpperCase(), setName: names[sid] || '', num: x.localId, price: 0 }; }), pickPrint);
+    }).catch(function (e) { ld.style.display = 'none'; box.innerHTML = '<div style="color:var(--danger)">Error: ' + esc(e.message) + '</div>'; });
+  }
+  function pickPrint(i) {
+    var p = prints[i]; if (!p || !artFor) return;
+    get('cards/' + encodeURIComponent(p.id)).then(function (d) {
+      var n = fromDex(d, artFor.qty), dk = AD.deck(), keep = artFor;
+      var dupe = dk.cards.filter(function (c) { return c.id === n.id && c !== keep; })[0];
+      if (dupe) { dupe.qty += keep.qty; dk.cards = dk.cards.filter(function (c) { return c !== keep; }); }
+      else { var q = keep.qty; Object.keys(n).forEach(function (k) { keep[k] = n[k]; }); keep.qty = q; }
+      AD.closeM('artModal'); AD.save(); AD.render(); AD.toast('Updated art');
+    }).catch(function (e) { AD.toast('Error: ' + e.message); });
+  }
+
+  // ---------- import / export (PTCG Live format) ----------
+  function parse(l) {
+    var s = l.trim(); if (!s || s[0] === '#' || s.indexOf('//') === 0 || /^total/i.test(s) || /^(pok[eé]mon|trainer|energy)\s*:\s*\d*$/i.test(s)) return null;
+    var m = s.match(/^(\d+)\s+(.+?)\s+([A-Z][A-Z0-9-]{1,5})\s+(\S+)$/);
+    if (m) return { qty: +m[1], name: m[2], code: m[3], num: m[4] };
+    m = s.match(/^(\d+)x?\s+(.+)$/i); return m ? { qty: +m[1], name: m[2].trim(), code: '', num: '' } : null;
+  }
+  function resolveLine(it) {
+    var names = [it.name], alt = it.name.replace(/^Basic\s+/i, ''); if (alt !== it.name) names.push(alt);
+    var z = function (s) { return String(s).replace(/^0+/, ''); };
+    function tryName(i) {
+      if (i >= names.length) return Promise.resolve(null);
+      return get('cards?name=' + encodeURIComponent(names[i])).then(function (l) {
+        var m = l.filter(function (x) { return norm(x.name) === norm(names[i]); }); if (!m.length) return tryName(i + 1);
+        var byNum = it.num ? m.filter(function (x) { return z(x.localId) === z(it.num); }) : [], pool = (byNum.length ? byNum : m).slice(-6).reverse();
+        return Promise.all(pool.map(function (x) { return get('cards/' + encodeURIComponent(x.id)).catch(function () { return null; }); })).then(function (ds) {
+          ds = ds.filter(Boolean);
+          return ds.filter(function (d) { return it.code && setCode(d) === it.code; })[0] || ds.filter(function (d) { return d.legal && d.legal.standard; })[0] || ds[0] || null;
+        });
+      });
+    }
+    return tryName(0);
+  }
+  function runImport() {
+    var items = $('importText').value.split(/\r?\n/).map(parse).filter(Boolean), st = $('statusMsg');
+    if (!items.length) { st.style.color = 'var(--danger)'; st.textContent = 'Paste deck lines first.'; return; }
+    var btn = document.querySelector('[data-action="run-import"]'), miss = [], done = 0, i = 0; btn.disabled = true; st.style.color = 'var(--cyan)';
+    function next() {
+      var b = items.slice(i, i + 4); i += 4; if (!b.length) return Promise.resolve();
+      return Promise.all(b.map(function (it) {
+        return resolveLine(it).then(function (d) { if (d) AD.addToDeck(fromDex(d, it.qty)); else miss.push(it.name); }).catch(function () { miss.push(it.name); })
+          .then(function () { done++; st.textContent = 'Resolved ' + done + '/' + items.length + '...'; });
+      })).then(next);
+    }
+    next().then(function () {
+      AD.save(); AD.render();
+      if (miss.length) { st.style.color = 'var(--gold)'; st.textContent = 'Imported, but not found: ' + miss.join(', '); }
+      else { AD.closeM('importModal'); $('importText').value = ''; st.textContent = ''; AD.toast('Cards imported!'); }
+    }).catch(function (e) { st.style.color = 'var(--danger)'; st.textContent = 'Import error: ' + e.message; }).then(function () { btn.disabled = false; });
+  }
+  function exportText(d) {
+    var g = { 'Pokémon': [], Trainer: [], Energy: [] }, out = [], tot = 0;
+    d.cards.forEach(function (c) { g[c.category === 'Trainer' ? 'Trainer' : c.category === 'Energy' ? 'Energy' : 'Pokémon'].push(c); });
+    Object.keys(g).forEach(function (k) {
+      if (!g[k].length) return; var n = g[k].reduce(function (s, c) { return s + c.qty; }, 0); tot += n; out.push(k + ': ' + n);
+      g[k].forEach(function (c) { out.push(c.qty + ' ' + c.name + ' ' + c.set + ' ' + c.collector_number); }); out.push('');
+    });
+    out.push('Total Cards: ' + tot); return out.join('\n');
+  }
+
+  // ---------- price optimiser support: cheapest identical reprint ----------
+  function sig(p) {
+    p = p || {};
+    return JSON.stringify([p.hp, p.types, p.stage, (p.attacks || []).map(function (a) { return [a.name, (a.cost || []).join(), a.damage, a.effect]; }), (p.abilities || []).map(function (a) { return [a.name, a.effect]; }), p.effect, p.retreat, (p.weaknesses || []).map(function (w) { return w.type + w.value; })]);
+  }
+  function cheapest(c) {
+    return get('cards?name=' + encodeURIComponent(c.name)).then(function (l) {
+      var m = l.filter(function (x) { return norm(x.name) === norm(c.name) && x.id !== c.id; }).slice(-24), sg = sig(c.pk);
+      return Promise.all(m.map(function (x) { return get('cards/' + encodeURIComponent(x.id)).catch(function () { return null; }); })).then(function (ds) {
+        var best = null;
+        ds.filter(Boolean).forEach(function (d) { var n = fromDex(d, c.qty); if (sig(n.pk) !== sg || !n.price) return; if (c.legal !== false && n.legal === false) return; if (!best || n.price < best.price) best = n; });
+        return best;
+      });
+    });
+  }
+
+  // ---------- wire into the app ----------
+  function wrap(k, f) { var o = AD.A[k]; AD.A[k] = function (b, e) { var d = AD.deck(); return (d && d.game === 'pokemon') ? f(b, e, o) : (o && o(b, e)); }; }
+  wrap('open-adv-search', function () { AD.openM('pkSearchModal'); loadSets(); });
+  wrap('run-import', runImport);
+  wrap('open-card-modal', function (b) { openCard(b.dataset.cardId); });
+  wrap('change-art', function (b) { openArt(b.dataset.cardId); });
+  wrap('qty-plus', function (b, e, o) { var c = AD.findCard(b.dataset.cardId), d = AD.deck(); if (c && !(c.pk && c.pk.basic) && copies(d, c.name) >= 4) { AD.toast('Max 4 copies of ' + c.name); return; } o(b, e); });
+  var A = AD.A;
+  A['pk-search'] = function () { runSearch(false); };
+  A['pk-more'] = function () { runSearch(true); };
+  A['pk-reset'] = function () { document.querySelectorAll('#pkSearchModal input[type=text]').forEach(function (i) { i.value = ''; }); document.querySelectorAll('#pkSearchModal select').forEach(function (s) { s.value = ''; }); $('pkLegal').checked = false; };
+  A['pk-info'] = function (b) { openCard(b.dataset.id, true); };
+  A['pk-add'] = function (b) { get('cards/' + encodeURIComponent(b.dataset.id)).then(function (d) { if (add(fromDex(d, 1))) { AD.save(); AD.render(); AD.toast('Added ' + d.name); } }).catch(function (e) { AD.toast('Error: ' + e.message); }); };
+  A['pk-add-cur'] = function () { if (curC && add(AD.cc(JSON.parse(JSON.stringify(curC))))) { AD.save(); AD.render(); showDetail(AD.findCard(curC.id) || curC, !!AD.findCard(curC.id)); } };
+  A['pk-qty'] = function (b) {
+    var d = +b.dataset.d; if (!curC || !inDeck) return;
+    if (d > 0 && !(curC.pk && curC.pk.basic) && copies(AD.deck(), curC.name) >= 4) { AD.toast('Max 4 copies of ' + curC.name); return; }
+    var id = curC.id; AD.qty(id, d); var c = AD.findCard(id); if (c) showDetail(c, true); else AD.closeM('pkDetailModal');
+  };
+  A['pk-remove'] = function () { if (curC) { AD.qty(curC.id, -curC.qty); AD.closeM('pkDetailModal'); AD.toast('Removed'); } };
+  A['pk-cover'] = function () { if (curC) { AD.deck().bannerArt = curC.art_crop || curC.image; AD.save(); AD.render(); AD.toast('Deck cover updated'); } };
+  A['pk-art'] = function () { if (curC) { var id = curC.id; AD.closeM('pkDetailModal'); openArt(id); } };
+  A['pk-lock'] = function () { if (curC) { curC.locked = !curC.locked; AD.save(); AD.render(); showDetail(curC, true); AD.toast(curC.locked ? '🔒 Printing locked' : 'Unlocked'); } };
+
+  AD.pk = { cheapest: cheapest, suggest: suggest, quickAdd: quickAdd, afterRender: afterRender, exportText: exportText };
+  if (document.readyState !== 'loading') AD.render();
+})();
+</script>
